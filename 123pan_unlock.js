@@ -1,9 +1,10 @@
 // ==UserScript==
-// @name         123云盘解锁
-// @author       QingJ
-// @namespace    https://github.com/QingJ01/123pan_unlock
-// @version      1.2.0
-// @description  专业的123云盘增强脚本 - 完美解锁会员功能、突破下载限制、去广告、支持自定义用户信息。整合秒传链接功能，支持生成和保存秒传文件，快速分享和保存文件。界面精美，功能强大，让你的123云盘体验更美好！
+// @name         123云盘增强
+// @author       MoozLee
+// @namespace    https://github.com/MoozLee/123pan_unlock
+// @version      1.3.0
+// @description  专业的123云盘增强脚本 - 完美解锁会员功能、突破下载限制、去广告、支持自定义用户信息。整合秒传链接功能，支持生成和保存秒传文件，快速分享和保存文件。新增文件夹重命名功能，支持从TMDB获取影视信息，自动添加拼音首字母前缀。界面精美，功能强大，让你的123云盘体验更美好！
+// @contributor  QingJ - 原项目作者 (https://github.com/QingJ01/123pan_unlock)
 // @contributor  Baoqing、Chaofan、lipkiat - 123FastLink秒传功能核心贡献者
 // @contributor  hmjz100 - 借鉴了部分适配代码
 // @license      Apache Licence 2
@@ -22,6 +23,7 @@
 // @grant        GM_setClipboard
 // @grant        GM_unregisterMenuCommand
 // @grant        GM_xmlhttpRequest
+// @require      https://cdn.jsdelivr.net/npm/pinyin@4.0.0-alpha.2/dist/pinyin.js
 // @run-at       document-start
 // ==/UserScript==
 
@@ -109,6 +111,13 @@
         mkdirDelay: 100,
         usesBase62EtagsInExport: true,
         COMMON_PATH_LINK_PREFIX: "123FLCPV2$"
+    };
+
+    // 重命名功能配置
+    const RenameConfig = {
+        enabled: true,
+        tmdbApiKey: GM_getValue('tmdb_api_key', ''),
+        tmdbApiBaseUrl: 'https://api.themoviedb.org/3'
     };
 
     // 1. API通信类
@@ -779,6 +788,427 @@
     // 秒传功能模块结束
     // =============================================================================
 
+    // =============================================================================
+    // 文件夹重命名功能模块
+    // =============================================================================
+
+    // 提取字符串中最长的连续中文字符串
+    function extractLongestChineseString(str) {
+        if (!str) return '';
+        const matches = str.match(/[\u4e00-\u9fa5]+/g);
+        if (!matches || matches.length === 0) return '';
+        return matches.reduce((longest, current) => 
+            current.length > longest.length ? current : longest, '');
+    }
+
+    // 获取字符串首字的拼音首字母（使用 pinyin.js 库）
+    function getFirstPinyinLetter(str) {
+        if (!str) return '';
+        
+        // 找到第一个中文字符
+        const match = str.match(/[\u4e00-\u9fa5]/);
+        if (match) {
+            try {
+                // 使用 pinyin.js 库获取拼音首字母
+                // pinyin 库通过 @require 引入，挂载在全局 pinyin 变量上
+                if (typeof pinyin !== 'undefined' && pinyin.pinyin) {
+                    const result = pinyin.pinyin(match[0], { style: 'first_letter' });
+                    if (result && result[0] && result[0][0]) {
+                        return result[0][0].toUpperCase();
+                    }
+                }
+            } catch (e) {
+                console.warn('[123云盘增强] pinyin库调用失败:', e);
+            }
+            return '';
+        }
+        
+        // 如果没有中文，返回第一个字母的大写
+        const letterMatch = str.match(/[a-zA-Z]/);
+        if (letterMatch) {
+            return letterMatch[0].toUpperCase();
+        }
+        return '';
+    }
+
+    // 从TMDB搜索电视剧信息
+    async function searchTMDB(query, type = 'tv') {
+        if (!RenameConfig.tmdbApiKey) {
+            throw new Error('请先在设置中配置TMDB API Key');
+        }
+        
+        const searchUrl = `${RenameConfig.tmdbApiBaseUrl}/search/${type}?api_key=${RenameConfig.tmdbApiKey}&query=${encodeURIComponent(query)}&language=zh-CN`;
+        
+        try {
+            const response = await fetch(searchUrl);
+            if (!response.ok) {
+                throw new Error(`TMDB API请求失败: ${response.status}`);
+            }
+            const data = await response.json();
+            return data.results || [];
+        } catch (error) {
+            console.error('[123云盘解锁] TMDB搜索失败:', error);
+            throw error;
+        }
+    }
+
+    // 调用123云盘重命名API
+    async function renameFile(fileId, newFileName) {
+        if (!panApiClient) {
+            throw new Error('API客户端未初始化');
+        }
+        
+        const headers = {
+            'Content-Type': 'application/json;charset=UTF-8',
+            'Authorization': 'Bearer ' + panApiClient.authToken,
+            'platform': 'web',
+            'App-Version': '3',
+            'LoginUuid': panApiClient.loginUuid,
+            'Origin': panApiClient.host,
+            'Referer': document.location.href,
+        };
+        
+        try {
+            const response = await fetch(`${panApiClient.host}/b/api/file/rename`, {
+                method: 'POST',
+                headers,
+                body: JSON.stringify({
+                    driveId: 0,
+                    fileId: fileId,
+                    fileName: newFileName
+                }),
+                credentials: 'include'
+            });
+            
+            const data = await response.json();
+            if (data.code !== 0) {
+                throw new Error(data.message || '重命名失败');
+            }
+            return data;
+        } catch (error) {
+            console.error('[123云盘解锁] 重命名失败:', error);
+            throw error;
+        }
+    }
+
+    // 获取当前选中的文件夹信息
+    async function getSelectedFolderInfo() {
+        if (!panApiClient) {
+            console.log('[123云盘解锁] panApiClient 未初始化');
+            return null;
+        }
+        
+        let selectedFileIds = [];
+        
+        // 方法1: 直接从DOM中获取当前选中的文件行 (通过 ant-table-row-selected 类)
+        const selectedRowsByClass = document.querySelectorAll('.ant-table-row.ant-table-row-selected');
+        selectedRowsByClass.forEach(row => {
+            const rowKey = row.getAttribute('data-row-key');
+            if (rowKey) {
+                selectedFileIds.push(rowKey);
+            }
+        });
+        console.log('[123云盘解锁] 方法1 (ant-table-row-selected):', selectedFileIds.length);
+        
+        // 方法2: 通过checkbox checked状态查找
+        if (selectedFileIds.length === 0) {
+            const allRows = document.querySelectorAll('.ant-table-row.ant-table-row-level-0');
+            allRows.forEach(row => {
+                // 检查checkbox是否选中 - 多种方式
+                const checkboxWrapper = row.querySelector('.ant-checkbox-wrapper');
+                const checkbox = row.querySelector('.ant-checkbox');
+                const input = row.querySelector('.ant-checkbox-input');
+                
+                const isChecked = 
+                    (checkboxWrapper && checkboxWrapper.classList.contains('ant-checkbox-wrapper-checked')) ||
+                    (checkbox && checkbox.classList.contains('ant-checkbox-checked')) ||
+                    (input && input.checked);
+                
+                if (isChecked) {
+                    const rowKey = row.getAttribute('data-row-key');
+                    if (rowKey) {
+                        selectedFileIds.push(rowKey);
+                    }
+                }
+            });
+            console.log('[123云盘解锁] 方法2 (checkbox状态):', selectedFileIds.length);
+        }
+        
+        // 方法3: 如果还没找到，尝试使用tableRowSelector
+        if (selectedFileIds.length === 0 && tableRowSelector) {
+            const selection = tableRowSelector.getSelection();
+            console.log('[123云盘解锁] 方法3 tableRowSelector:', selection);
+            if (selection.isSelectAll) {
+                const allRows = document.querySelectorAll('.ant-table-row.ant-table-row-level-0');
+                allRows.forEach(row => {
+                    const rowKey = row.getAttribute('data-row-key');
+                    if (rowKey && !selection.unselectedRowKeys.includes(rowKey)) {
+                        selectedFileIds.push(rowKey);
+                    }
+                });
+            } else {
+                selectedFileIds = selection.selectedRowKeys;
+            }
+        }
+        
+        console.log('[123云盘解锁] 最终选中的文件IDs:', selectedFileIds);
+        
+        if (selectedFileIds.length === 0) {
+            return null;
+        }
+        
+        // 只取第一个选中的文件
+        const fileId = selectedFileIds[0];
+        if (!fileId) return null;
+        
+        try {
+            const response = await panApiClient.getFileInfo([fileId]);
+            console.log('[123云盘解锁] API响应:', response);
+            if (response.data && response.data.InfoList && response.data.InfoList.length > 0) {
+                const fileInfo = response.data.InfoList[0];
+                return {
+                    fileId: fileInfo.FileId,
+                    fileName: fileInfo.FileName,
+                    type: fileInfo.Type, // 1 = 文件夹, 0 = 文件
+                    etag: fileInfo.Etag,
+                    size: fileInfo.Size
+                };
+            }
+        } catch (error) {
+            console.error('[123云盘解锁] 获取文件信息失败:', error);
+        }
+        return null;
+    }
+
+    // 显示重命名弹窗
+    function showRenameModal(folderInfo) {
+        const originalName = folderInfo.fileName;
+        const longestChinese = extractLongestChineseString(originalName);
+        
+        const modal = document.createElement('div');
+        modal.className = 'fastlink-modal-overlay';
+        modal.id = 'rename-modal';
+        modal.innerHTML = `
+            <div class="fastlink-modal rename-modal-container">
+                <button class="close-btn" id="close-rename-modal">×</button>
+                <h3 style="margin: 0 0 16px 0 !important; flex-shrink: 0;">📝 修改文件夹名称</h3>
+                
+                <div class="rename-form-scroll">
+                    <div class="rename-row">
+                        <label>原文件夹名：</label>
+                        <input type="text" id="rename-original" value="${originalName}" readonly 
+                               style="background: rgba(245,245,245,0.8); cursor: not-allowed;">
+                    </div>
+                    
+                    <div class="rename-row" style="display: flex; gap: 10px; align-items: flex-end;">
+                        <div style="flex: 1;">
+                            <label>中文名称（用于搜索）：</label>
+                            <input type="text" id="rename-chinese" value="${longestChinese}" 
+                                   placeholder="提取的最长连续中文串">
+                        </div>
+                        <button class="tmdb-btn" id="fetch-tmdb-btn">从TMDB获取</button>
+                    </div>
+                    
+                    <div id="tmdb-results" class="tmdb-results-container"></div>
+                    
+                    <div class="rename-row" style="margin-bottom: 0;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+                            <label style="margin-bottom: 0 !important;">新文件夹名：</label>
+                            <label class="pinyin-switch-label">
+                                <input type="checkbox" id="add-pinyin-prefix" checked>
+                                <span>添加首字拼音</span>
+                            </label>
+                        </div>
+                        <input type="text" id="rename-new" value="" placeholder="输入新的文件夹名称">
+                    </div>
+                </div>
+                
+                <div class="rename-modal-footer">
+                    <button class="copy-btn" id="rename-save-btn">保存</button>
+                    <button class="export-btn" id="rename-cancel-btn">取消</button>
+                </div>
+            </div>
+        `;
+        
+        document.body.appendChild(modal);
+        
+        // 关闭按钮事件
+        modal.querySelector('#close-rename-modal').addEventListener('click', () => modal.remove());
+        modal.querySelector('#rename-cancel-btn').addEventListener('click', () => modal.remove());
+        modal.addEventListener('click', (e) => {
+            if (e.target === modal) modal.remove();
+        });
+        
+        // TMDB搜索按钮事件
+        modal.querySelector('#fetch-tmdb-btn').addEventListener('click', async () => {
+            const chineseName = modal.querySelector('#rename-chinese').value.trim();
+            if (!chineseName) {
+                showFastLinkToast('请输入中文名称用于搜索', 'warning');
+                return;
+            }
+            
+            if (!RenameConfig.tmdbApiKey) {
+                showFastLinkToast('请先在设置中配置TMDB API Key', 'warning');
+                return;
+            }
+            
+            const btn = modal.querySelector('#fetch-tmdb-btn');
+            const originalText = btn.textContent;
+            btn.textContent = '搜索中...';
+            btn.disabled = true;
+            
+            try {
+                const results = await searchTMDB(chineseName, 'tv');
+                const resultsContainer = modal.querySelector('#tmdb-results');
+                
+                if (results.length === 0) {
+                    resultsContainer.innerHTML = '<div style="color: #888; text-align: center; padding: 12px;">未找到相关结果</div>';
+                } else {
+                    const TMDB_IMG_BASE = 'https://image.tmdb.org/t/p/w92';
+                    resultsContainer.innerHTML = results.slice(0, 8).map((item, index) => {
+                        const name = item.name || item.title || '';
+                        const originalName = item.original_name || item.original_title || '';
+                        const year = (item.first_air_date || item.release_date || '').split('-')[0];
+                        const displayName = year ? `${name} (${year})` : name;
+                        const posterUrl = item.poster_path ? `${TMDB_IMG_BASE}${item.poster_path}` : '';
+                        const overview = item.overview || '';
+                        const shortOverview = overview.length > 80 ? overview.substring(0, 80) + '...' : overview;
+                        return `
+                            <div class="tmdb-result-item" data-name="${name}" data-year="${year}" data-id="${item.id}" style="display: flex; gap: 12px; align-items: flex-start;">
+                                ${posterUrl ? `<img src="${posterUrl}" alt="${name}" style="width: 46px; height: 68px; object-fit: cover; border-radius: 4px; flex-shrink: 0;">` : '<div style="width: 46px; height: 68px; background: #eee; border-radius: 4px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; color: #ccc; font-size: 12px;">无图</div>'}
+                                <div style="flex: 1; min-width: 0;">
+                                    <div style="font-weight: 500;">${displayName}</div>
+                                    ${originalName && originalName !== name ? `<div style="font-size: 12px; color: #888;">${originalName}</div>` : ''}
+                                    ${shortOverview ? `<div style="font-size: 12px; color: #666; margin-top: 4px; line-height: 1.4;">${shortOverview}</div>` : ''}
+                                </div>
+                            </div>
+                        `;
+                    }).join('');
+                    
+                    // 点击结果项填充到新名称输入框
+                    resultsContainer.querySelectorAll('.tmdb-result-item').forEach(item => {
+                        item.addEventListener('click', () => {
+                            const name = item.dataset.name;
+                            const year = item.dataset.year;
+                            const tmdbId = item.dataset.id;
+                            const addPinyin = modal.querySelector('#add-pinyin-prefix').checked;
+                            
+                            let newName = year ? `${name} (${year}) {tmdbid-${tmdbId}}` : `${name} {tmdbid-${tmdbId}}`;
+                            
+                            // 如果开启了首字拼音，添加前缀
+                            if (addPinyin) {
+                                const pinyinLetter = getFirstPinyinLetter(name);
+                                if (pinyinLetter) {
+                                    newName = `${pinyinLetter} ${newName}`;
+                                }
+                            }
+                            
+                            modal.querySelector('#rename-new').value = newName;
+                            
+                            // 高亮选中项
+                            resultsContainer.querySelectorAll('.tmdb-result-item').forEach(el => {
+                                el.style.background = '';
+                            });
+                            item.style.background = 'rgba(76, 175, 80, 0.15)';
+                        });
+                    });
+                }
+                
+                resultsContainer.style.display = 'block';
+            } catch (error) {
+                showFastLinkToast('TMDB搜索失败: ' + error.message, 'error');
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        });
+        
+        // 首字拼音开关事件 - 切换时自动更新新文件夹名
+        modal.querySelector('#add-pinyin-prefix').addEventListener('change', (e) => {
+            const newNameInput = modal.querySelector('#rename-new');
+            let currentName = newNameInput.value.trim();
+            if (!currentName) return;
+            
+            // 检查当前名称是否以单个大写字母+空格开头（拼音前缀格式）
+            const pinyinPrefixMatch = currentName.match(/^([A-Z])\s+(.+)$/);
+            
+            if (e.target.checked) {
+                // 开启：添加拼音前缀
+                if (!pinyinPrefixMatch) {
+                    // 当前没有拼音前缀，添加一个
+                    const pinyinLetter = getFirstPinyinLetter(currentName);
+                    if (pinyinLetter) {
+                        newNameInput.value = `${pinyinLetter} ${currentName}`;
+                    }
+                }
+            } else {
+                // 关闭：移除拼音前缀
+                if (pinyinPrefixMatch) {
+                    newNameInput.value = pinyinPrefixMatch[2];
+                }
+            }
+        });
+        
+        // 保存按钮事件
+        modal.querySelector('#rename-save-btn').addEventListener('click', async () => {
+            const newName = modal.querySelector('#rename-new').value.trim();
+            if (!newName) {
+                showFastLinkToast('请输入新的文件夹名称', 'warning');
+                return;
+            }
+            
+            if (newName === originalName) {
+                showFastLinkToast('新名称与原名称相同', 'warning');
+                return;
+            }
+            
+            const btn = modal.querySelector('#rename-save-btn');
+            const originalText = btn.textContent;
+            btn.textContent = '保存中...';
+            btn.disabled = true;
+            
+            try {
+                await renameFile(folderInfo.fileId, newName);
+                showFastLinkToast('重命名成功！', 'success');
+                modal.remove();
+                // 刷新页面以显示新名称
+                setTimeout(() => {
+                    window.location.reload();
+                }, 500);
+            } catch (error) {
+                showFastLinkToast('重命名失败: ' + error.message, 'error');
+            } finally {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }
+        });
+        
+        // 聚焦到新名称输入框
+        setTimeout(() => {
+            modal.querySelector('#rename-new').focus();
+        }, 100);
+    }
+
+    // 显示重命名按钮点击处理
+    async function handleRenameClick() {
+        if (!panApiClient || !tableRowSelector) {
+            showFastLinkToast('功能未初始化，请刷新页面', 'error');
+            return;
+        }
+        
+        const folderInfo = await getSelectedFolderInfo();
+        if (!folderInfo) {
+            showFastLinkToast('请先选择一个文件或文件夹', 'warning');
+            return;
+        }
+        
+        showRenameModal(folderInfo);
+    }
+
+    // =============================================================================
+    // 文件夹重命名功能模块结束
+    // =============================================================================
+
     // 保存原始方法
     const originalXHR = unsafeWindow.XMLHttpRequest;
     const originalFetch = unsafeWindow.fetch;
@@ -1306,7 +1736,7 @@
         // 判断设置类型 - 修复等级1被误判为开关的问题
         const switchKeys = ['VIP状态', 'SVIP显示', '长期会员显示', '广告控制', '秒传功能', '调试模式'];
         const isSwitch = switchKeys.includes(key) && typeof value === 'number' && (value === 0 || value === 1);
-        const isEditable = ['用户名', '头像', '等级', '过期时间'].includes(key);
+        const isEditable = ['用户名', '头像', '等级', '过期时间', 'TMDB API Key'].includes(key);
 
         if (isSwitch) {
             // 创建开关按钮
@@ -1447,6 +1877,10 @@
                         user.endtime = newValue;
                         GM_setValue('endtime', newValue);
                         break;
+                    case 'TMDB API Key':
+                        RenameConfig.tmdbApiKey = newValue;
+                        GM_setValue('tmdb_api_key', newValue);
+                        break;
                 }
 
                 // 显示保存成功提示
@@ -1544,6 +1978,7 @@
             { key: '头像', value: user.photo, comment: '自定义头像URL（建议使用HTTPS地址）' },
             { key: '等级', value: user.level, comment: '成长容量等级（0-128，数字越大容量越大）' },
             { key: '过期时间', value: user.endtime, comment: '会员过期时间（可自定义任意时间）' },
+            { key: 'TMDB API Key', value: RenameConfig.tmdbApiKey, comment: '用于从TMDB获取影视信息（可在 themoviedb.org 注册获取）' },
             { key: '调试模式', value: user.debug, comment: '调试信息显示级别' }
         ];
 
@@ -2230,6 +2665,59 @@
         }, 3000);
     }
 
+    // 添加重命名按钮
+    function addRenameButton() {
+        if (!RenameConfig.enabled) {
+            return;
+        }
+        
+        const checkAndAddButton = () => {
+            // 检查是否在文件页面
+            const isFilePage = window.location.pathname === "/" && 
+                              !window.location.search.includes("sharekey=") && 
+                              !window.location.pathname.includes("/account");
+            
+            if (!isFilePage) {
+                return;
+            }
+            
+            // 检查按钮是否已存在
+            if (document.getElementById('rename-trigger')) {
+                return;
+            }
+            
+            const trigger = document.createElement('button');
+            trigger.id = 'rename-trigger';
+            trigger.title = '重命名文件/文件夹';
+            trigger.innerHTML = `
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                </svg>
+            `;
+            
+            trigger.addEventListener('click', () => {
+                handleRenameClick();
+            });
+            
+            document.body.appendChild(trigger);
+        };
+        
+        // 立即尝试添加按钮
+        checkAndAddButton();
+        
+        // 定期检查按钮是否还在
+        setInterval(() => {
+            const btn = document.getElementById('rename-trigger');
+            const isFilePage = window.location.pathname === "/" && 
+                              !window.location.search.includes("sharekey=") && 
+                              !window.location.pathname.includes("/account");
+            if (isFilePage && (!btn || !document.body.contains(btn))) {
+                checkAndAddButton();
+            }
+        }, 3000);
+    }
+
     function toggleFastLinkMenu(e) {
         e.stopPropagation();
         const menu = document.getElementById('fastlink-menu');
@@ -2663,6 +3151,205 @@
                     box-shadow: 0 8px 25px rgba(76, 175, 80, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
                 }
                 
+                /* 重命名按钮样式 */
+                #rename-trigger {
+                    position: fixed !important;
+                    bottom: 160px !important;
+                    right: 20px !important;
+                    width: 54px !important;
+                    height: 54px !important;
+                    background: rgba(255, 152, 0, 0.9) !important;
+                    backdrop-filter: blur(15px) !important;
+                    -webkit-backdrop-filter: blur(15px) !important;
+                    color: white !important;
+                    border: 1px solid rgba(255, 255, 255, 0.2) !important;
+                    border-radius: 50% !important;
+                    cursor: pointer !important;
+                    z-index: 9999 !important;
+                    box-shadow: 0 6px 20px rgba(255, 152, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.1) inset !important;
+                    display: flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    transition: all 0.3s ease !important;
+                }
+                
+                #rename-trigger:hover {
+                    background: rgba(245, 124, 0, 0.95) !important;
+                    transform: scale(1.05) !important;
+                    box-shadow: 0 8px 25px rgba(255, 152, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.2) inset !important;
+                }
+                
+                /* 重命名弹窗样式 */
+                .rename-form {
+                    text-align: left !important;
+                }
+                
+                .rename-row {
+                    margin-bottom: 16px !important;
+                }
+                
+                .rename-row label {
+                    display: block !important;
+                    margin-bottom: 6px !important;
+                    font-size: 14px !important;
+                    color: #555 !important;
+                    font-weight: 500 !important;
+                }
+                
+                .rename-row input {
+                    width: 100% !important;
+                    padding: 12px 14px !important;
+                    border: 2px solid #e1e5e9 !important;
+                    border-radius: 10px !important;
+                    font-size: 14px !important;
+                    transition: all 0.3s ease !important;
+                    box-sizing: border-box !important;
+                    outline: none !important;
+                    background: rgba(250, 251, 252, 0.7) !important;
+                }
+                
+                .rename-row input:focus {
+                    border-color: #FF9800 !important;
+                    background: rgba(255, 255, 255, 0.9) !important;
+                    box-shadow: 0 0 0 3px rgba(255, 152, 0, 0.1) !important;
+                }
+                
+                .tmdb-btn {
+                    background: linear-gradient(135deg, #01b4e4 0%, #0d253f 100%) !important;
+                    color: white !important;
+                    border: none !important;
+                    padding: 12px 18px !important;
+                    cursor: pointer !important;
+                    border-radius: 10px !important;
+                    font-size: 14px !important;
+                    font-weight: 500 !important;
+                    white-space: nowrap !important;
+                    transition: all 0.3s ease !important;
+                    box-shadow: 0 4px 12px rgba(1, 180, 228, 0.3) !important;
+                }
+                
+                .tmdb-btn:hover {
+                    transform: translateY(-2px) !important;
+                    box-shadow: 0 8px 20px rgba(1, 180, 228, 0.4) !important;
+                }
+                
+                .tmdb-btn:disabled {
+                    opacity: 0.7 !important;
+                    cursor: not-allowed !important;
+                    transform: none !important;
+                }
+                
+                .tmdb-result-item {
+                    padding: 10px 12px !important;
+                    border: 1px solid #e1e5e9 !important;
+                    border-radius: 8px !important;
+                    margin-bottom: 8px !important;
+                    cursor: pointer !important;
+                    transition: all 0.2s ease !important;
+                    background: #fff !important;
+                }
+                
+                .tmdb-result-item:hover {
+                    border-color: #01b4e4 !important;
+                    background: rgba(1, 180, 228, 0.08) !important;
+                }
+                
+                .tmdb-result-item:last-child {
+                    margin-bottom: 0 !important;
+                }
+                
+                .tmdb-result-item img {
+                    box-shadow: 0 2px 6px rgba(0,0,0,0.1) !important;
+                }
+                
+                /* 重命名弹窗专用样式 */
+                .rename-modal-container {
+                    width: 520px !important;
+                    max-width: 90vw !important;
+                    max-height: 85vh !important;
+                    display: flex !important;
+                    flex-direction: column !important;
+                    padding: 24px !important;
+                }
+                
+                .rename-form-scroll {
+                    flex: 1 !important;
+                    overflow-y: auto !important;
+                    overflow-x: hidden !important;
+                    padding-right: 8px !important;
+                    margin-right: -8px !important;
+                    text-align: left !important;
+                }
+                
+                .rename-form-scroll::-webkit-scrollbar {
+                    width: 6px !important;
+                }
+                
+                .rename-form-scroll::-webkit-scrollbar-track {
+                    background: rgba(0,0,0,0.05) !important;
+                    border-radius: 3px !important;
+                }
+                
+                .rename-form-scroll::-webkit-scrollbar-thumb {
+                    background: rgba(0,0,0,0.2) !important;
+                    border-radius: 3px !important;
+                }
+                
+                .rename-form-scroll::-webkit-scrollbar-thumb:hover {
+                    background: rgba(0,0,0,0.3) !important;
+                }
+                
+                .tmdb-results-container {
+                    display: none;
+                    margin: 12px 0 !important;
+                    max-height: 280px !important;
+                    overflow-y: auto !important;
+                    border: 1px solid #e1e5e9 !important;
+                    border-radius: 10px !important;
+                    padding: 8px !important;
+                    background: rgba(248, 249, 250, 0.5) !important;
+                }
+                
+                .tmdb-results-container::-webkit-scrollbar {
+                    width: 6px !important;
+                }
+                
+                .tmdb-results-container::-webkit-scrollbar-track {
+                    background: transparent !important;
+                }
+                
+                .tmdb-results-container::-webkit-scrollbar-thumb {
+                    background: rgba(0,0,0,0.15) !important;
+                    border-radius: 3px !important;
+                }
+                
+                .rename-modal-footer {
+                    display: flex !important;
+                    gap: 12px !important;
+                    justify-content: center !important;
+                    margin-top: 20px !important;
+                    padding-top: 16px !important;
+                    border-top: 1px solid rgba(0,0,0,0.06) !important;
+                    flex-shrink: 0 !important;
+                }
+                
+                .pinyin-switch-label {
+                    display: flex !important;
+                    align-items: center !important;
+                    gap: 6px !important;
+                    font-size: 13px !important;
+                    color: #666 !important;
+                    cursor: pointer !important;
+                    user-select: none !important;
+                }
+                
+                .pinyin-switch-label input[type="checkbox"] {
+                    width: 16px !important;
+                    height: 16px !important;
+                    cursor: pointer !important;
+                    accent-color: #FF9800 !important;
+                }
+                
                 .fastlink-menu {
                     position: fixed !important;
                     display: none;
@@ -2985,6 +3672,12 @@
                 });
                 
                 console.log('[123云盘解锁] 秒传菜单关闭监听器已添加');
+            }
+            
+            // 初始化重命名功能（需要秒传功能的基础设施）
+            if (RenameConfig.enabled && FastLinkConfig.enabled) {
+                addRenameButton(); // 添加重命名按钮
+                console.log('[123云盘解锁] 重命名功能已启用');
             }
         } else {
             setTimeout(waitForBody, 100);
